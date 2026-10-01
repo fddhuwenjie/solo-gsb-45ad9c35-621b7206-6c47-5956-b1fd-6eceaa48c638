@@ -1,0 +1,12 @@
+services:
+  rotating-stage:
+    build: ./backend
+    image: rotating-stage-app:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - stage-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  stage-data:
