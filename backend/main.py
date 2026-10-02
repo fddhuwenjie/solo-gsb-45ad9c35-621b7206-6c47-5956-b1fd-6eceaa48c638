@@ -730,6 +730,37 @@ def _override_entity_keyframe(entities: list[dict], eid: int,
     kfs.sort(key=lambda k: k["t_ms"])
 
 
+def stored_frame_from_global(by_id: dict, pos: dict[int, tuple], angle: float,
+                             stage_radius: float, fid: int,
+                             chain: list[int], msg_prefix: str,
+                             t_ms: int):
+    """把从属实体 t 时刻的全局传播位置换算为落库坐标并做越界检查。
+
+    随台实体反算为转台局部坐标、固定实体直接用全局坐标；越界则抛 409
+    （带冲突链）。返回 (follower_id, x, y)。
+    """
+    gx, gy = pos[fid]
+    e = by_id[fid]
+    if math.hypot(gx, gy) + e["radius"] > stage_radius + EPS:
+        raise conflict_exception(
+            "out_of_bounds",
+            f"{msg_prefix}从属实体「{e['name']}」的传播位置"
+            f"({gx:.2f}, {gy:.2f}) 超出舞台（半径 {stage_radius:g}m），"
+            f"冲突链：{' → '.join(chain_names(by_id, chain))}",
+            chain=chain, chain_names=chain_names(by_id, chain),
+            t_ms=t_ms, x=round(gx, 3), y=round(gy, 3),
+        )
+    if e["mounted"] == "rotating":
+        # 全局反算为转台局部坐标：R(angle) 的逆 = R(-angle) 的转置，
+        # 不能直接用 to_global(..., -angle)（那是镜像，差 180°）
+        r = math.radians(angle)
+        c, s = math.cos(r), math.sin(r)
+        lx, ly = gx * c + gy * s, -gx * s + gy * c
+    else:
+        lx, ly = gx, gy
+    return fid, round(lx, 3), round(ly, 3)
+
+
 def propagate_edit(entities: list[dict], turntable: list[dict],
                    formations: list[dict], stage_radius: float,
                    t_ms: int, angle_override: float | None,
@@ -770,33 +801,91 @@ def propagate_edit(entities: list[dict], turntable: list[dict],
     for fid in targets:
         if fid not in pos:
             continue                       # 上游缺关键帧，该时刻无法解析
-        gx, gy = pos[fid]
-        e = by_id[fid]
-        if math.hypot(gx, gy) + e["radius"] > stage_radius + EPS:
-            if source == "leader":
-                chain = bfs_chain(children, edited_id, fid) or [edited_id, fid]
-                msg_head = "编辑主实体关键帧"
-            else:
-                chain = root_chain(parent, fid)
-                msg_head = "编辑共享转台姿态"
-            raise conflict_exception(
-                "out_of_bounds",
-                f"{msg_head}后，从属实体「{e['name']}」的传播位置"
-                f"({gx:.2f}, {gy:.2f}) 超出舞台（半径 {stage_radius:g}m），"
-                f"冲突链：{' → '.join(chain_names(by_id, chain))}",
-                chain=chain, chain_names=chain_names(by_id, chain),
-                t_ms=t_ms, x=round(gx, 3), y=round(gy, 3),
-            )
-        if e["mounted"] == "rotating":
-            # 全局反算为转台局部坐标：R(angle) 的逆 = R(-angle) 的转置，
-            # 不能直接用 to_global(..., -angle)（那是镜像，差 180°）
-            r = math.radians(angle)
-            c, s = math.cos(r), math.sin(r)
-            lx, ly = gx * c + gy * s, -gx * s + gy * c
+        if source == "leader":
+            chain = bfs_chain(children, edited_id, fid) or [edited_id, fid]
+            msg_prefix = "编辑主实体关键帧后，"
         else:
-            lx, ly = gx, gy
-        updates.append((fid, round(lx, 3), round(ly, 3)))
+            chain = root_chain(parent, fid)
+            msg_prefix = "编辑共享转台姿态后，"
+        updates.append(stored_frame_from_global(
+            by_id, pos, angle, stage_radius, fid, chain, msg_prefix, t_ms))
     return updates
+
+
+def _chain_uses_turntable(parent: dict[int, dict], by_id: dict[int, dict],
+                         fid: int) -> bool:
+    """从 fid 沿主实体边向上到根的链上是否存在随台实体。
+
+    只要链上有随台实体，fid 的全局位置就会依赖共享转台角度
+    （随台根随转台旋转；固定主 -> 随台从 的随台实体自身也按转台角定位）。
+    """
+    cur = fid
+    seen = set()
+    while cur not in seen:
+        if by_id[cur]["mounted"] == "rotating":
+            return True
+        seen.add(cur)
+        par = parent.get(cur)
+        if par is None:
+            return False
+        cur = par["leader_id"]
+    return False
+
+
+def _link_subtree(children: dict[int, list[int]], root_id: int) -> list[int]:
+    """约束图中 root_id 下游全部从属实体（不含 root_id 自身），拓扑序。"""
+    out: list[int] = []
+    seen = {root_id}
+    stack = list(children.get(root_id, []))
+    while stack:
+        fid = stack.pop(0)
+        if fid in seen:
+            continue
+        seen.add(fid)
+        out.append(fid)
+        stack.extend(children.get(fid, []))
+    return out
+
+
+def propagate_link(entities: list[dict], turntable: list[dict],
+                   formations: list[dict], stage_radius: float,
+                   leader_id: int, follower_id: int):
+    """新增或修改一条跟随关系（候选关系已并入 formations）后，为从属实体
+    子树补算全部相关时刻的关键帧。
+
+    时刻集合 = 主实体已有位置关键帧时刻 ∪ 相关共享转台关键帧时刻
+    （仅当下游链上有随台实体时，转台时刻才会影响传播位置）。每个时刻按
+    随台/固定语义沿链解析，任一传播位置越界即抛 409（带冲突链）。
+
+    返回 {t_ms: [(follower_id, x, y), ...]}，坐标按从属实体自身语义
+    （随台=局部坐标，固定=全局坐标）；调用方校验通过后再统一写库。
+    """
+    by_id = {e["id"]: e for e in entities}
+    parent, children = build_link_map(formations)
+
+    # 受影响的从属链：新从属实体自身 + 它的全部下游从属实体
+    targets = [follower_id] + _link_subtree(children, follower_id)
+
+    leader_kfs = by_id.get(leader_id, {}).get("keyframes", [])
+    times = {k["t_ms"] for k in leader_kfs}
+    # 下游链上存在随台实体时，转台角度的每个分段断点都可能是位置断点
+    if any(_chain_uses_turntable(parent, by_id, fid) for fid in targets):
+        times.update(k["t_ms"] for k in turntable)
+
+    result: dict[int, list] = {}
+    for t_ms in sorted(times):
+        pos, _, _, angle = scenario_positions(
+            entities, turntable, parent, children, t_ms)
+        for fid in targets:
+            if fid not in pos:
+                continue                   # 上游缺关键帧，该时刻无法解析
+            chain = bfs_chain(children, leader_id, fid) \
+                or [leader_id, follower_id]
+            frame = stored_frame_from_global(
+                by_id, pos, angle, stage_radius, fid, chain,
+                "应用队形关系后，", t_ms)
+            result.setdefault(t_ms, []).append(frame)
+    return result
 
 
 # --------------------------------------------------------------------------
