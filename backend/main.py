@@ -13,8 +13,8 @@
 - formation_groups / formation_links（v2 新增，队形约束）：
   有向跟随关系 主实体 -> 从属实体，每条关系带相对距离 distance 与
   相对角度 angle（以**主实体坐标架**为准：随台主实体用转台局部架，
-  固定主实体用全局架）。编辑主实体关键帧或共享转台姿态时，沿约束图
-  拓扑传播、为从属实体生成/覆盖关键帧。约束图成环、从属实体被多个
+  固定主实体用全局架）。编辑主实体关键帧、共享转台姿态或增改跟随关系时，
+  沿约束图拓扑传播、为从属实体生成/覆盖关键帧。约束图成环、从属实体被多个
   主实体驱动、传播后关键帧越界，都会**整单拒绝**（HTTP 409）并带冲突链。
 
 计算规则
@@ -544,6 +544,19 @@ def build_link_map(formations: list[dict]):
     return parent, children
 
 
+def candidate_formations(formations: list[dict], group_id: int,
+                         link: dict) -> list[dict]:
+    """把候选关系并入编队结构，供「投影场景」预算使用（不改动原数据）：
+    先移除各编队中同 id 的旧关系，再把候选关系挂到目标编队。"""
+    out = []
+    for g in formations:
+        links = [lk for lk in g["links"] if lk["id"] != link["id"]]
+        if g["id"] == group_id:
+            links = links + [link]
+        out.append({**g, "links": links})
+    return out
+
+
 def detect_cycle(children: dict[int, list[int]]):
     """迭代 DFS 检测有向环，返回环上节点链（首尾同 id）；无环返回 None。"""
     nodes = set(children)
@@ -730,6 +743,26 @@ def _override_entity_keyframe(entities: list[dict], eid: int,
     kfs.sort(key=lambda k: k["t_ms"])
 
 
+def stored_coords(e: dict, gx: float, gy: float, angle: float):
+    """全局坐标换算为落库坐标：随台实体存转台局部坐标（全局位置按当前
+    转台角做逆旋转 R(-angle)），固定实体直接存全局坐标。"""
+    if e["mounted"] == "rotating":
+        r = math.radians(angle)
+        c, s = math.cos(r), math.sin(r)
+        return gx * c + gy * s, -gx * s + gy * c
+    return gx, gy
+
+
+def upsert_keyframe_rows(conn: sqlite3.Connection, frames: list[tuple]) -> None:
+    """把 (entity_id, t_ms, x, y) 关键帧批量落库，同实体同时刻覆盖。"""
+    conn.executemany(
+        "INSERT INTO keyframes (entity_id, t_ms, x, y) VALUES (?,?,?,?) "
+        "ON CONFLICT(entity_id, t_ms) DO UPDATE SET "
+        "x = excluded.x, y = excluded.y",
+        frames,
+    )
+
+
 def propagate_edit(entities: list[dict], turntable: list[dict],
                    formations: list[dict], stage_radius: float,
                    t_ms: int, angle_override: float | None,
@@ -787,15 +820,76 @@ def propagate_edit(entities: list[dict], turntable: list[dict],
                 chain=chain, chain_names=chain_names(by_id, chain),
                 t_ms=t_ms, x=round(gx, 3), y=round(gy, 3),
             )
-        if e["mounted"] == "rotating":
-            # 全局反算为转台局部坐标：R(angle) 的逆 = R(-angle) 的转置，
-            # 不能直接用 to_global(..., -angle)（那是镜像，差 180°）
-            r = math.radians(angle)
-            c, s = math.cos(r), math.sin(r)
-            lx, ly = gx * c + gy * s, -gx * s + gy * c
-        else:
-            lx, ly = gx, gy
+        lx, ly = stored_coords(e, gx, gy, angle)
         updates.append((fid, round(lx, 3), round(ly, 3)))
+    return updates
+
+
+def propagate_link_edit(entities: list[dict], turntable: list[dict],
+                        formations: list[dict], stage_radius: float,
+                        leader_id: int, follower_id: int):
+    """候选跟随关系（formations 为已并入候选关系的投影）沿链预算从属关键帧。
+
+    时刻集合 = 主实体链（根 -> 直接主实体）已有关键帧 ∪ 相关共享转台关键帧
+    （根到从属实体的链上有随台实体时，转台角度才影响传播结果）。逐时刻按
+    随台/固定语义计算全部下游从属实体的落帧；任一传播位置越界抛 409
+    （带冲突链），调用方据此整单拒绝。返回 [(follower_id, t_ms, x, y), ...]，
+    坐标为落库语义（随台=局部坐标，固定=全局坐标）。
+    """
+    by_id = {e["id"]: e for e in entities}
+    parent, children = build_link_map(formations)
+
+    # 受影响从属实体：候选关系的从属实体及其全部下游
+    targets = []
+    stack = [follower_id]
+    seen = set()
+    while stack:
+        fid = stack.pop()
+        if fid in seen:
+            continue
+        seen.add(fid)
+        targets.append(fid)
+        stack.extend(children.get(fid, []))
+
+    # 时刻并集：主实体链（根 -> 直接主实体）已有关键帧的时刻
+    times = set()
+    for eid in root_chain(parent, leader_id):
+        e = by_id.get(eid)
+        if e:
+            times.update(k["t_ms"] for k in e["keyframes"])
+
+    # 相关共享转台关键帧：根到任一受影响从属实体的链上有随台实体时，
+    # 转台角度才会改变传播结果或落库坐标
+    rotating_involved = any(
+        by_id[eid]["mounted"] == "rotating"
+        for fid in targets
+        for eid in root_chain(parent, fid)
+        if eid in by_id
+    )
+    if rotating_involved:
+        times.update(k["t_ms"] for k in turntable)
+
+    updates = []
+    for t in sorted(times):
+        pos, _grot, _gdep, angle = scenario_positions(
+            entities, turntable, parent, children, t)
+        for fid in targets:
+            if fid not in pos:
+                continue                   # 上游缺关键帧，该时刻无法解析
+            gx, gy = pos[fid]
+            e = by_id[fid]
+            if math.hypot(gx, gy) + e["radius"] > stage_radius + EPS:
+                chain = root_chain(parent, fid)
+                raise conflict_exception(
+                    "out_of_bounds",
+                    f"编辑跟随关系后，从属实体「{e['name']}」在 {t}ms 的传播位置"
+                    f"({gx:.2f}, {gy:.2f}) 超出舞台（半径 {stage_radius:g}m），"
+                    f"冲突链：{' → '.join(chain_names(by_id, chain))}",
+                    chain=chain, chain_names=chain_names(by_id, chain),
+                    t_ms=t, x=round(gx, 3), y=round(gy, 3),
+                )
+            lx, ly = stored_coords(e, gx, gy, angle)
+            updates.append((fid, t, round(lx, 3), round(ly, 3)))
     return updates
 
 
@@ -983,14 +1077,8 @@ def upsert_keyframe(eid: int, payload: KeyframeIn):
                 "ON CONFLICT(t_ms) DO UPDATE SET angle = excluded.angle",
                 (payload.t_ms, payload.angle),
             )
-        for fid, x, y in propagated:
-            conn.execute(
-                "INSERT INTO keyframes (entity_id, t_ms, x, y) "
-                "VALUES (?,?,?,?) "
-                "ON CONFLICT(entity_id, t_ms) DO UPDATE SET "
-                "x = excluded.x, y = excluded.y",
-                (fid, payload.t_ms, x, y),
-            )
+        upsert_keyframe_rows(
+            conn, [(fid, payload.t_ms, x, y) for fid, x, y in propagated])
         refresh_risks(conn)
         return build_state(conn)
 
@@ -1029,14 +1117,8 @@ def upsert_turntable_keyframe(payload: TurntableKeyframeIn):
             "ON CONFLICT(t_ms) DO UPDATE SET angle = excluded.angle",
             (payload.t_ms, payload.angle),
         )
-        for fid, x, y in propagated:
-            conn.execute(
-                "INSERT INTO keyframes (entity_id, t_ms, x, y) "
-                "VALUES (?,?,?,?) "
-                "ON CONFLICT(entity_id, t_ms) DO UPDATE SET "
-                "x = excluded.x, y = excluded.y",
-                (fid, payload.t_ms, x, y),
-            )
+        upsert_keyframe_rows(
+            conn, [(fid, payload.t_ms, x, y) for fid, x, y in propagated])
         refresh_risks(conn)
         return build_state(conn)
 
@@ -1099,16 +1181,36 @@ def delete_formation(gid: int):
 
 @app.post("/api/formations/{gid}/links", status_code=201)
 def create_link(gid: int, payload: FormationLinkIn):
+    """新增跟随关系：先把候选关系并入约束图，收集主实体链关键帧与相关共享
+    转台关键帧的时刻并集，沿链预算全部从属关键帧；成环/多主/自指/传播越界
+    整单拒绝（409，关系与关键帧均不变），通过后在同一事务中写入关系、
+    落从属帧并重算风险。"""
     with db() as conn:
         if conn.execute("SELECT id FROM formation_groups WHERE id = ?", (gid,)) \
                 .fetchone() is None:
             raise HTTPException(status_code=404, detail="编队不存在")
         entities = load_entities(conn)
         by_id = {e["id"]: e for e in entities}
+        turntable = load_turntable(conn)
         formations = load_formations(conn)
+        stage_radius = load_settings(conn)["stage_radius"]
         # 成环 / 多主 / 自指：整单拒绝并指出冲突链（此时尚未写库）
         validate_candidate_link(
             by_id, formations, payload.leader_id, payload.follower_id)
+
+        # 候选关系并入约束图做投影预算；任一传播位置越界抛 409，
+        # 此时尚未写库，关系与关键帧都保持原样
+        candidate = candidate_formations(formations, gid, {
+            "id": None,
+            "leader_id": payload.leader_id,
+            "follower_id": payload.follower_id,
+            "distance": payload.distance,
+            "angle": payload.angle,
+        })
+        propagated = propagate_link_edit(
+            entities, turntable, candidate, stage_radius,
+            payload.leader_id, payload.follower_id)
+
         try:
             conn.execute(
                 "INSERT INTO formation_links "
@@ -1124,11 +1226,16 @@ def create_link(gid: int, payload: FormationLinkIn):
                 f"从属实体 #{payload.follower_id} 已被其它主实体驱动",
                 follower_id=payload.follower_id,
             )
+        upsert_keyframe_rows(conn, propagated)
+        refresh_risks(conn)
         return build_state(conn)
 
 
 @app.put("/api/formations/links/{lid}")
 def update_link(lid: int, payload: FormationLinkUpdate):
+    """修改跟随关系（距离/角度/所属编队）：与新增同样先做投影预算，
+    传播越界整单拒绝（409，关系与关键帧均不变），通过后在同一事务中
+    更新关系、落从属帧并重算风险。"""
     with db() as conn:
         row = conn.execute("SELECT * FROM formation_links WHERE id = ?", (lid,)) \
             .fetchone()
@@ -1143,21 +1250,37 @@ def update_link(lid: int, payload: FormationLinkUpdate):
                 or payload.group_id is not None:
             entities = load_entities(conn)
             by_id = {e["id"]: e for e in entities}
+            turntable = load_turntable(conn)
             formations = load_formations(conn)
+            stage_radius = load_settings(conn)["stage_radius"]
             # 主从不变时同样要重新做一次成环/多主校验（组间转移后图不变，
             # 但保留校验以杜绝脏数据）
             validate_candidate_link(
                 by_id, formations, row["leader_id"], row["follower_id"],
                 ignore_link_id=lid,
             )
+            new_distance = payload.distance if payload.distance is not None \
+                else row["distance"]
+            new_angle = payload.angle if payload.angle is not None else row["angle"]
+            # 候选关系（新距离/角度/编队）并入约束图做投影预算；
+            # 任一传播位置越界抛 409，此时尚未写库
+            candidate = candidate_formations(formations, new_group, {
+                "id": lid,
+                "leader_id": row["leader_id"],
+                "follower_id": row["follower_id"],
+                "distance": new_distance,
+                "angle": new_angle,
+            })
+            propagated = propagate_link_edit(
+                entities, turntable, candidate, stage_radius,
+                row["leader_id"], row["follower_id"])
             conn.execute(
                 "UPDATE formation_links SET group_id = ?, distance = ?, angle = ? "
                 "WHERE id = ?",
-                (new_group,
-                 payload.distance if payload.distance is not None else row["distance"],
-                 payload.angle if payload.angle is not None else row["angle"],
-                 lid),
+                (new_group, new_distance, new_angle, lid),
             )
+            upsert_keyframe_rows(conn, propagated)
+            refresh_risks(conn)
         return build_state(conn)
 
 
